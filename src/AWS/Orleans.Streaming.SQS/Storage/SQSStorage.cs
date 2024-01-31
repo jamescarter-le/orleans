@@ -3,12 +3,14 @@ using Amazon.SQS;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Threading.Tasks;
 using Amazon.SQS.Model;
 using Microsoft.Extensions.Logging;
 using Orleans.Streaming.SQS;
 using SQSMessage = Amazon.SQS.Model.Message;
 using Orleans;
+using Orleans.Configuration;
 
 namespace OrleansAWSUtils.Storage
 {
@@ -23,10 +25,13 @@ namespace OrleansAWSUtils.Storage
         public const int MAX_NUMBER_OF_MESSAGE_TO_PEAK = 10;
         private const string AccessKeyPropertyName = "AccessKey";
         private const string SecretKeyPropertyName = "SecretKey";
+        private const string SessionTokenPropertyName = "SessionToken";
         private const string ServicePropertyName = "Service";
+        private readonly SqsOptions sqsOptions;
         private readonly ILogger Logger;
         private string accessKey;
         private string secretKey;
+        private string sessionToken;
         private string service;
         private string queueUrl;
         private AmazonSQSClient sqsClient;
@@ -41,18 +46,22 @@ namespace OrleansAWSUtils.Storage
         /// </summary>
         /// <param name="loggerFactory">logger factory to use</param>
         /// <param name="queueName">The name of the queue</param>
-        /// <param name="connectionString">The connection string</param>
+        /// <param name="sqsOptions">The options for the SQS connection</param>
         /// <param name="serviceId">The service ID</param>
-        public SQSStorage(ILoggerFactory loggerFactory, string queueName, string connectionString, string serviceId = "")
+        public SQSStorage(ILoggerFactory loggerFactory, string queueName, SqsOptions sqsOptions, string serviceId = "")
         {
+            if (sqsOptions is null) throw new ArgumentNullException(nameof(sqsOptions));
+            this.sqsOptions = sqsOptions;
             QueueName = string.IsNullOrWhiteSpace(serviceId) ? queueName : $"{serviceId}-{queueName}";
-            ParseDataConnectionString(connectionString);
+            ParseDataConnectionString(sqsOptions.ConnectionString);
             Logger = loggerFactory.CreateLogger<SQSStorage>();
             CreateClient();
         }
 
         private void ParseDataConnectionString(string dataConnectionString)
         {
+            if(string.IsNullOrEmpty(dataConnectionString)) throw new ArgumentNullException(nameof(dataConnectionString));
+
             var parameters = dataConnectionString.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
 
             var serviceConfig = parameters.Where(p => p.Contains(ServicePropertyName)).FirstOrDefault();
@@ -78,6 +87,14 @@ namespace OrleansAWSUtils.Storage
                 if (value.Length == 2 && !string.IsNullOrWhiteSpace(value[1]))
                     accessKey = value[1];
             }
+
+            var sessionTokenConfig = parameters.Where(p => p.Contains(SessionTokenPropertyName)).FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(sessionTokenConfig))
+            {
+                var value = sessionTokenConfig.Split(new[] { '=' }, StringSplitOptions.RemoveEmptyEntries);
+                if (value.Length == 2 && !string.IsNullOrWhiteSpace(value[1]))
+                    sessionToken = value[1];
+            }
         }
 
         private void CreateClient()
@@ -88,6 +105,12 @@ namespace OrleansAWSUtils.Storage
                 // Local SQS instance (for testing)
                 var credentials = new BasicAWSCredentials("dummy", "dummyKey");
                 sqsClient = new AmazonSQSClient(credentials, new AmazonSQSConfig { ServiceURL = service });
+            }
+            else if (!string.IsNullOrEmpty(accessKey) && !string.IsNullOrEmpty(secretKey) && !string.IsNullOrEmpty(sessionToken))
+            {
+                // AWS SQS instance (auth via explicit credentials)
+                var credentials = new SessionAWSCredentials(accessKey, secretKey, sessionToken);
+                sqsClient = new AmazonSQSClient(credentials, new AmazonSQSConfig { RegionEndpoint = AWSUtils.GetRegionEndpoint(service) });
             }
             else if (!string.IsNullOrEmpty(accessKey) && !string.IsNullOrEmpty(secretKey))
             {
@@ -169,7 +192,11 @@ namespace OrleansAWSUtils.Storage
                     throw new InvalidOperationException("Queue not initialized");
 
                 message.QueueUrl = queueUrl;
-                await sqsClient.SendMessageAsync(message);
+                var response = await sqsClient.SendMessageAsync(message);
+                if (response.HttpStatusCode != HttpStatusCode.OK)
+                {
+                    throw new Exception("Failed to send message into SQS. ");
+                }
             }
             catch (Exception exc)
             {
@@ -192,7 +219,17 @@ namespace OrleansAWSUtils.Storage
                 if (count < 1)
                     throw new ArgumentOutOfRangeException(nameof(count));
 
-                var request = new ReceiveMessageRequest { QueueUrl = queueUrl, MaxNumberOfMessages = count <= MAX_NUMBER_OF_MESSAGE_TO_PEAK ? count : MAX_NUMBER_OF_MESSAGE_TO_PEAK };
+                var request = new ReceiveMessageRequest
+                {
+                    QueueUrl = queueUrl,
+                    MaxNumberOfMessages = count <= MAX_NUMBER_OF_MESSAGE_TO_PEAK ? count : MAX_NUMBER_OF_MESSAGE_TO_PEAK,
+                    AttributeNames = sqsOptions.ReceiveAttributes,
+                    MessageAttributeNames = sqsOptions.ReceiveMessageAttributes,
+                };
+
+                if (sqsOptions.ReceiveWaitTimeSeconds.HasValue)
+                    request.WaitTimeSeconds = sqsOptions.ReceiveWaitTimeSeconds.Value;
+
                 var response = await sqsClient.ReceiveMessageAsync(request);
                 return response.Messages;
             }
